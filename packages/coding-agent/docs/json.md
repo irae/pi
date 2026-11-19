@@ -65,7 +65,7 @@ A turn is one assistant response plus any tool calls and tool results produced b
 |---|---|---|
 | `message_start` | `message` | A message started. |
 | `message_update` | `usage`, `assistantMessageEvent` | An assistant message emitted a content-block update. |
-| `message_end` | `message` | A message completed. This is the authoritative final message. |
+| `message_end` | `message` | A message completed. This is the authoritative final message. A failed assistant message can include `error` when Pi recognized the failure; see [Message Types](message-types.md#assistantmessage). |
 
 ### Reconstruct streaming messages
 

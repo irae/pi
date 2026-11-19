@@ -134,6 +134,7 @@ interface AssistantMessage {
   stopReason: "pending" | "stop" | "length" | "toolUse" | "error" | "aborted" | "deferred";
   deferred?: DeferredHandle;
   errorMessage?: string;
+  error?: AssistantError;
   rawStopReason?: string;
   endTurn?: boolean;
   timestamp: number;
@@ -141,6 +142,17 @@ interface AssistantMessage {
 ```
 
 `responseModel` records the concrete model reported by the provider, when the provider reports one. It may equal the requested model. `responseId`, `providerThinkingLevel`, `thinkingLevel`, `diagnostics`, and `rawStopReason` preserve provider or runtime details.
+
+`error` is set only when Pi recognized the provider failure. `errorMessage` remains the display text. A rate limit uses `error.type` `"rate_limit"`. `error.resetTime`, when present, is the provider's explicit usage-window reset as Unix milliseconds. Pi does not derive it from a retry delay.
+
+```typescript
+interface AssistantRateLimitError {
+  type: "rate_limit";
+  resetTime?: number;
+}
+
+type AssistantError = AssistantRateLimitError;
+```
 
 `"pending"` is used for a partial assistant message while it streams. The completed message in `message_end` has a terminal stop reason, and Pi does not persist `"pending"` assistant messages in session JSONL.
 
