@@ -590,6 +590,15 @@ export interface UserMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
+/** A provider failure Pi recognized, independent of the display text in `errorMessage`. */
+export type AssistantError = AssistantRateLimitError;
+
+export interface AssistantRateLimitError {
+	type: "rate_limit";
+	/** Unix milliseconds. Present only when the provider reported an explicit usage-window reset. */
+	resetTime?: number;
+}
+
 export interface AssistantMessage {
 	role: "assistant";
 	content: (TextContent | ThinkingContent | ToolCall)[];
@@ -607,6 +616,11 @@ export interface AssistantMessage {
 	stopReason: StopReason;
 	deferred?: DeferredHandle;
 	errorMessage?: string;
+	/**
+	 * Recognized provider failure. `resetTime` is Unix milliseconds taken from an explicit
+	 * usage-window reset, never from a retry delay. Absent when the failure was not recognized.
+	 */
+	error?: AssistantError;
 	rawStopReason?: string;
 	/**
 	 * Provider indication of whether the model explicitly ended its turn.

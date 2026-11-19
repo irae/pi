@@ -30,6 +30,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { getIdentityHeaders } from "../utils/identity.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
+import { carryRateLimit, rateLimitFromErrorFields, rateLimitFromThrown } from "../utils/rate-limit.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 import {
 	getDeclaredTools,
@@ -440,24 +441,25 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					}
 
 					const errorText = await response.text();
+					const info = await parseErrorResponse(
+						new Response(errorText, { status: response.status, statusText: response.statusText }),
+					);
 					if (attempt < maxRetries && isRetryableError(response.status, errorText)) {
-						const retryAfterDelayMs = getRetryAfterDelayMs(response.headers);
-						const delayMs =
-							retryAfterDelayMs === undefined
-								? BASE_DELAY_MS * 2 ** attempt
-								: validateRetryDelayMs(retryAfterDelayMs, options);
-
-						await sleep(delayMs, options?.signal);
-						continue;
+						try {
+							const retryAfterDelayMs = getRetryAfterDelayMs(response.headers);
+							const delayMs =
+								retryAfterDelayMs === undefined
+									? BASE_DELAY_MS * 2 ** attempt
+									: validateRetryDelayMs(retryAfterDelayMs, options);
+							await sleep(delayMs, options?.signal);
+							continue;
+						} catch (error) {
+							if (error instanceof RetryDelayExceededError) carryRateLimit(error, info.rateLimit);
+							throw error;
+						}
 					}
 
-					// Parse error for friendly message on final attempt or non-retryable error
-					const fakeResponse = new Response(errorText, {
-						status: response.status,
-						statusText: response.statusText,
-					});
-					const info = await parseErrorResponse(fakeResponse);
-					throw new Error(info.friendlyMessage || info.message);
+					throw carryRateLimit(new Error(info.friendlyMessage || info.message), info.rateLimit);
 				} catch (error) {
 					if (error instanceof Error) {
 						if (error.name === "AbortError" || error.message === "Request was aborted") {
@@ -503,6 +505,10 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 		} catch (error) {
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = formatProviderError(normalizeProviderError(error));
+			if (output.stopReason === "error") {
+				const rateLimit = rateLimitFromThrown(error);
+				if (rateLimit) output.error = rateLimit;
+			}
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -779,17 +785,23 @@ async function* mapCodexEvents(
 
 		if (type === "error") {
 			const { code, message } = extractCodexEventError(event);
-			throw new CodexApiError(`Codex error: ${message || code || JSON.stringify(event)}`, {
-				code,
-				payload: event,
-			});
+			throw carryRateLimit(
+				new CodexApiError(`Codex error: ${message || code || JSON.stringify(event)}`, {
+					code,
+					payload: event,
+				}),
+				rateLimitFromErrorFields(event.error, typeof event.status === "number" ? event.status : undefined),
+			);
 		}
 
 		if (type === "response.failed") {
 			const response = (event as { response?: { error?: { code?: string; message?: string } } }).response;
 			const code = response?.error?.code;
 			const message = response?.error?.message;
-			throw new CodexApiError(message || "Codex response failed", { code, payload: event });
+			throw carryRateLimit(
+				new CodexApiError(message || "Codex response failed", { code, payload: event }),
+				rateLimitFromErrorFields(response?.error),
+			);
 		}
 
 		if (type === "response.done" || type === "response.completed" || type === "response.incomplete") {
@@ -1616,16 +1628,20 @@ async function processWebSocketStream(
 // Error Handling
 // ============================================================================
 
-async function parseErrorResponse(response: Response): Promise<{ message: string; friendlyMessage?: string }> {
+async function parseErrorResponse(
+	response: Response,
+): Promise<{ message: string; friendlyMessage?: string; rateLimit?: ReturnType<typeof rateLimitFromErrorFields> }> {
 	const raw = await response.text();
 	let message = raw || response.statusText || "Request failed";
 	let friendlyMessage: string | undefined;
+	let rateLimit: ReturnType<typeof rateLimitFromErrorFields>;
 
 	try {
 		const parsed = JSON.parse(raw) as {
 			error?: { code?: string; type?: string; message?: string; plan_type?: string; resets_at?: number };
 		};
 		const err = parsed?.error;
+		rateLimit = rateLimitFromErrorFields(err, response.status);
 		if (err) {
 			const code = err.code || err.type || "";
 			if (/usage_limit_reached|usage_not_included|rate_limit_exceeded/i.test(code) || response.status === 429) {
@@ -1638,9 +1654,11 @@ async function parseErrorResponse(response: Response): Promise<{ message: string
 			}
 			message = err.message || friendlyMessage || message;
 		}
-	} catch {}
+	} catch {
+		rateLimit = undefined;
+	}
 
-	return { message, friendlyMessage };
+	return { message, friendlyMessage, rateLimit };
 }
 
 // ============================================================================

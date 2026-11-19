@@ -21,6 +21,7 @@ import { headersToRecord } from "../utils/headers.ts";
 import { type ClientIdentity, getIdentityHeaders } from "../utils/identity.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
+import { rateLimitFromThrown } from "../utils/rate-limit.ts";
 import { getDeclaredTools, resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
@@ -263,6 +264,10 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				output.errorMessage = `${errorMessage}\n${CHATGPT_WORKSPACE_LIMIT_HINT}`;
 			} else {
 				output.errorMessage = errorMessage;
+			}
+			if (output.stopReason === "error") {
+				const rateLimit = rateLimitFromThrown(error);
+				if (rateLimit) output.error = rateLimit;
 			}
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
