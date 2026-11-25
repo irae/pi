@@ -30,6 +30,7 @@ import { writeDiagnosticsToStderr } from "../diagnostics-stderr.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { toJsonEvent } from "../json-event.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
+import { formatRpcEvent } from "./rate-limit-event.ts";
 import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
@@ -327,7 +328,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
 		unsubscribe = session.subscribe((event) => {
-			output(toJsonEvent(event));
+			output(formatRpcEvent(toJsonEvent(event)));
 			if (event.type === "agent_settled") {
 				checkShutdownRequested();
 			}

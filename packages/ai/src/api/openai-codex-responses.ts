@@ -30,6 +30,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { getIdentityHeaders } from "../utils/identity.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
+import { attachProviderRateLimitError, ProviderRateLimitError } from "../utils/provider-rate-limit-error.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 import {
 	getDeclaredTools,
@@ -440,24 +441,27 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					}
 
 					const errorText = await response.text();
+					const info = await parseErrorResponse(
+						new Response(errorText, { status: response.status, statusText: response.statusText }),
+					);
 					if (attempt < maxRetries && isRetryableError(response.status, errorText)) {
-						const retryAfterDelayMs = getRetryAfterDelayMs(response.headers);
-						const delayMs =
-							retryAfterDelayMs === undefined
-								? BASE_DELAY_MS * 2 ** attempt
-								: validateRetryDelayMs(retryAfterDelayMs, options);
-
-						await sleep(delayMs, options?.signal);
-						continue;
+						try {
+							const retryAfterDelayMs = getRetryAfterDelayMs(response.headers);
+							const delayMs =
+								retryAfterDelayMs === undefined
+									? BASE_DELAY_MS * 2 ** attempt
+									: validateRetryDelayMs(retryAfterDelayMs, options);
+							await sleep(delayMs, options?.signal);
+							continue;
+						} catch (error) {
+							if (error instanceof RetryDelayExceededError && info.rateLimit) {
+								throw new ProviderRateLimitError(error.message, info.rateLimit.rateLimit.resetTime);
+							}
+							throw error;
+						}
 					}
 
-					// Parse error for friendly message on final attempt or non-retryable error
-					const fakeResponse = new Response(errorText, {
-						status: response.status,
-						statusText: response.statusText,
-					});
-					const info = await parseErrorResponse(fakeResponse);
-					throw new Error(info.friendlyMessage || info.message);
+					throw info.rateLimit ?? new Error(info.friendlyMessage || info.message);
 				} catch (error) {
 					if (error instanceof Error) {
 						if (error.name === "AbortError" || error.message === "Request was aborted") {
@@ -503,6 +507,9 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 		} catch (error) {
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = formatProviderError(normalizeProviderError(error));
+			if (output.stopReason === "error" && error instanceof ProviderRateLimitError) {
+				attachProviderRateLimitError(output, error);
+			}
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -734,6 +741,7 @@ class ProviderStreamEventCallbackError extends Error {
 
 function isCodexNonTransportError(error: unknown): boolean {
 	return (
+		error instanceof ProviderRateLimitError ||
 		error instanceof CodexApiError ||
 		error instanceof CodexProtocolError ||
 		error instanceof ProviderStreamEventCallbackError
@@ -779,17 +787,16 @@ async function* mapCodexEvents(
 
 		if (type === "error") {
 			const { code, message } = extractCodexEventError(event);
-			throw new CodexApiError(`Codex error: ${message || code || JSON.stringify(event)}`, {
-				code,
-				payload: event,
-			});
+			const text = `Codex error: ${message || code || JSON.stringify(event)}`;
+			throw codexRateLimitError(event.error, text) ?? new CodexApiError(text, { code, payload: event });
 		}
 
 		if (type === "response.failed") {
 			const response = (event as { response?: { error?: { code?: string; message?: string } } }).response;
 			const code = response?.error?.code;
 			const message = response?.error?.message;
-			throw new CodexApiError(message || "Codex response failed", { code, payload: event });
+			const text = message || "Codex response failed";
+			throw codexRateLimitError(response?.error, text) ?? new CodexApiError(text, { code, payload: event });
 		}
 
 		if (type === "response.done" || type === "response.completed" || type === "response.incomplete") {
@@ -1616,10 +1623,30 @@ async function processWebSocketStream(
 // Error Handling
 // ============================================================================
 
-async function parseErrorResponse(response: Response): Promise<{ message: string; friendlyMessage?: string }> {
+const CODEX_RATE_LIMIT_CODE = /^(?:usage_limit_reached|usage_not_included|rate_limit_exceeded)$/i;
+
+function codexRateLimitError(body: unknown, message: string): ProviderRateLimitError | undefined {
+	if (typeof body !== "object" || body === null) return undefined;
+	const record = body as { code?: unknown; type?: unknown; resets_at?: unknown };
+	const code =
+		typeof record.code === "string" ? record.code : typeof record.type === "string" ? record.type : undefined;
+	if (code === undefined || !CODEX_RATE_LIMIT_CODE.test(code)) return undefined;
+	return new ProviderRateLimitError(message, unixSeconds(record.resets_at));
+}
+
+function unixSeconds(value: unknown): number | undefined {
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) return undefined;
+	const resetTime = value * 1000;
+	return Number.isSafeInteger(resetTime) ? resetTime : undefined;
+}
+
+async function parseErrorResponse(
+	response: Response,
+): Promise<{ message: string; friendlyMessage?: string; rateLimit?: ProviderRateLimitError }> {
 	const raw = await response.text();
 	let message = raw || response.statusText || "Request failed";
 	let friendlyMessage: string | undefined;
+	let rateLimit: ProviderRateLimitError | undefined;
 
 	try {
 		const parsed = JSON.parse(raw) as {
@@ -1637,10 +1664,13 @@ async function parseErrorResponse(response: Response): Promise<{ message: string
 				friendlyMessage = `You have hit your ChatGPT usage limit${plan}.${when}`.trim();
 			}
 			message = err.message || friendlyMessage || message;
+			rateLimit = codexRateLimitError(err, friendlyMessage || message);
 		}
-	} catch {}
+	} catch {
+		rateLimit = undefined;
+	}
 
-	return { message, friendlyMessage };
+	return { message, friendlyMessage, rateLimit };
 }
 
 // ============================================================================

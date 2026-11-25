@@ -20,6 +20,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { type ClientIdentity, getIdentityHeaders } from "../utils/identity.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
+import { attachProviderRateLimitError, ProviderRateLimitError } from "../utils/provider-rate-limit-error.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { getDeclaredTools, resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
@@ -264,6 +265,11 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			} else {
 				output.errorMessage = errorMessage;
 			}
+			if (output.stopReason === "error") {
+				const rateLimit =
+					error instanceof ProviderRateLimitError ? error : openAIResponsesRateLimitError(error, errorMessage);
+				if (rateLimit) attachProviderRateLimitError(output, rateLimit);
+			}
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -452,4 +458,44 @@ function applyServiceTierPricing(
 	usage.cost.cacheRead *= multiplier;
 	usage.cost.cacheWrite *= multiplier;
 	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
+}
+
+const OPENAI_RESPONSES_RATE_LIMIT_CODE =
+	/^(?:rate_limit_exceeded|subscription_sharing_usage_limit_exceeded|subscription_sharing_workplace_individual_usage_limit_exceeded)$/i;
+
+function openAIResponsesRateLimitError(error: unknown, message: string): ProviderRateLimitError | undefined {
+	const body = openAIResponsesErrorBody(error);
+	if (!body) return undefined;
+	const code = typeof body.code === "string" ? body.code : undefined;
+	const type = typeof body.type === "string" ? body.type : undefined;
+	if (code !== undefined && /insufficient_quota|billing/i.test(code)) return undefined;
+	if (type !== "rate_limit_error" && (code === undefined || !OPENAI_RESPONSES_RATE_LIMIT_CODE.test(code)))
+		return undefined;
+	return new ProviderRateLimitError(message, resetTimeFromSeconds(body.resets_at));
+}
+
+function openAIResponsesErrorBody(error: unknown): { code?: unknown; type?: unknown; resets_at?: unknown } | undefined {
+	if (typeof error !== "object" || error === null) return undefined;
+	const record = error as {
+		code?: unknown;
+		type?: unknown;
+		error?: unknown;
+		responseError?: unknown;
+		cause?: unknown;
+	};
+	const responseError = record.responseError;
+	if (typeof responseError === "object" && responseError !== null) {
+		const nested = responseError as { code?: unknown; type?: unknown; resets_at?: unknown; error?: unknown };
+		if (typeof nested.error === "object" && nested.error !== null) return nested.error;
+		return nested;
+	}
+	if (typeof record.error === "object" && record.error !== null) return record.error;
+	if (typeof record.code === "string" || typeof record.type === "string") return record;
+	return openAIResponsesErrorBody(record.cause);
+}
+
+function resetTimeFromSeconds(value: unknown): number | undefined {
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) return undefined;
+	const resetTime = value * 1000;
+	return Number.isSafeInteger(resetTime) ? resetTime : undefined;
 }
