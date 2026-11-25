@@ -86,6 +86,8 @@ Malformed JSON produces a parse response without a request ID:
 
 A success response only covers command handling. Provider failures and aborts after a prompt is accepted appear in the message and event stream.
 
+When the provider threw a rate limit, the `message_end` assistant message includes `error`. `error.type` is `"rate_limit"`. `error.resetTime`, when present, is the provider's explicit usage-window reset in Unix milliseconds. It is not derived from a retry delay, and it is not stored in the session file.
+
 Clients must also handle child-process startup failures, unexpected exits, stderr diagnostics, cancellation, and their own deadlines. Do not parse stderr as protocol data.
 
 ## Shutdown
